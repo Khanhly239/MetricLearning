@@ -6,123 +6,141 @@ import torch.nn as nn
 import torchvision
 import umap
 import wandb
+from datetime import datetime
+import torch
+import os
+from tqdm import tqdm
 
 from cycler import cycler
-from ds import get_celeba , valid_ds, train_ds
+from ds import get_celeba 
+from Model import get_model
 from PIL import Image
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import pytorch_metric_learning
 import pytorch_metric_learning.utils.logging_presets as logging_presets
 from pytorch_metric_learning import losses, miners, samplers, testers, trainers
 from pytorch_metric_learning.utils.accuracy_calculator import AccuracyCalculator
+from pytorch_metric_learning.utils import common_functions
+from pytorch_metric_learning.distances import CosineSimilarity
+from pytorch_metric_learning.reducers import ThresholdReducer
 
-wandb.init(project="metriclearning")
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+now = datetime.now().strftime("%m_%d_%Y_%H_%M_%S")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-class MLP(nn.Module):
-    # layer_sizes[0] is the dimension of the input
-    # layer_sizes[-1] is the dimension of the output
-    def __init__(self, layer_sizes, final_relu=False):
-        super().__init__()
-        layer_list = []
-        layer_sizes = [int(x) for x in layer_sizes]
-        num_layers = len(layer_sizes) - 1
-        final_relu_layer = num_layers if final_relu else num_layers - 1
-        for i in range(len(layer_sizes) - 1):
-            input_size = layer_sizes[i]
-            curr_size = layer_sizes[i + 1]
-            if i < final_relu_layer:
-                layer_list.append(nn.ReLU(inplace=False))
-            layer_list.append(nn.Linear(input_size, curr_size))
-        self.net = nn.Sequential(*layer_list)
-        self.last_linear = self.net[-1]
+def trainer(args):
 
-    def forward(self, x):
-        return self.net(x)
-    
-# Set trunk model and replace the softmax layer with an identity function
-trunk = torchvision.models.resnet18(pretrained=True)
-trunk_output_size = trunk.fc.in_features
-trunk.fc = nn.Identity()
-trunk = torch.nn.DataParallel(trunk.to(device))
+    if torch.cuda.is_available():
+        device = torch.device("cuda", index=args.idx)
+    else:
+        device = torch.device("cpu")
 
-# Set embedder model. This takes in the output of the trunk and outputs 64 dimensional embeddings
-embedder = torch.nn.DataParallel(MLP([trunk_output_size, 64]).to(device))
-# Set optimizers
-trunk_optimizer = torch.optim.Adam(trunk.parameters(), lr=0.00001, weight_decay=0.0001)
-embedder_optimizer = torch.optim.Adam(
-    embedder.parameters(), lr=0.0001, weight_decay=0.0001
-)
-# Set the loss function
-loss = losses.TripletMarginLoss(margin=0.1)
+    train_ld, valid_ld,test_ld, args = get_celeba(args)
 
-# Set the mining function
-miner = miners.MultiSimilarityMiner(epsilon=0.1)
+    print(f"#TRAIN Batch: {len(train_ld)}")
+    print(f"#VALID Batch: {len(valid_ld)}")
+    print(f"#TEST Batch: {len(test_ld)}")
+    # if args.log:
+    #     run = wandb.init(
+    #         project='metriclearning',
+    #         config=args,
+    #         name=now,
+    #         force=True
+    #     )
 
-# Set the dataloader sampler
-sampler = samplers.MPerClassSampler(
-    train_ds.targets, m=4, length_before_new_iter=len(train_ds)
-)
+    run_dir = os.getcwd() + '/runs'
+    if not os.path.exists(run_dir):
+        os.mkdir(run_dir)
+    sv_dir = run_dir + f"/{now}"
+    if not os.path.exists(sv_dir):
+        os.mkdir(sv_dir)
+    best_model_path = sv_dir + f'/best.pt'
+    last_model_path = sv_dir + f'/last.pt'
+    model = get_model(args).to(device)
 
-# Set other training parameters
-batch_size = 32
-num_epochs = 4
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total Params: {total_params}")
+    total_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Params: {total_train_params}")
 
-# Package the above stuff into dictionaries.
-models = {"trunk": trunk, "embedder": embedder}
-optimizers = {
-    "trunk_optimizer": trunk_optimizer,
-    "embedder_optimizer": embedder_optimizer,
-}
-loss_funcs = {"metric_loss": loss}
-mining_funcs = {"tuple_miner": miner}
-record_keeper, _, _ = logging_presets.get_record_keeper(
-    "example_logs", "example_tensorboard"
-)
-hooks = logging_presets.get_hook_container(record_keeper)
-dataset_dict = {"val": valid_ds}
-model_folder = "example_saved_models"
+    optimizer = Adam(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, len(train_ld) * args.epoch)
 
-def visualizer_hook(umapper, umap_embeddings, labels, split_name, keyname, *args):
-    logging.info(
-        "UMAP plot for the {} split and label set {}".format(split_name, keyname)
+    old_valid_loss = 1e26
+    distance = CosineSimilarity()
+    reducer = ThresholdReducer(low=0)
+    loss_func = losses.TripletMarginLoss(margin=0.2, distance=distance, reducer=reducer)
+    mining_func = miners.TripletMarginMiner(
+        margin=0.2, distance=distance, type_of_triplets="semihard"
     )
-    label_set = np.unique(labels)
-    num_classes = len(label_set)
-    plt.figure(figsize=(20, 15))
-    plt.gca().set_prop_cycle(
-        cycler(
-            "color", [plt.cm.nipy_spectral(i) for i in np.linspace(0, 0.9, num_classes)]
-        )
-    )
-    for i in range(num_classes):
-        idx = labels == label_set[i]
-        plt.plot(umap_embeddings[idx, 0], umap_embeddings[idx, 1], ".", markersize=1)
-    plt.show()
-# Create the tester
-tester = testers.GlobalEmbeddingSpaceTester(
-    end_of_testing_hook=hooks.end_of_testing_hook,
-    visualizer=umap.UMAP(),
-    visualizer_hook=visualizer_hook,
-    dataloader_num_workers=2,
-    accuracy_calculator=AccuracyCalculator(k="max_bin_count"),
-)
+    #accuracy_calculator = AccuracyCalculator(include=("precision_at_1",), k=1)
+    for epoch in range(args.epoch):
+        log_dict = {}
+        model.train()
+        total_loss = 0
+        train_pbar = tqdm(train_ld, desc=f"Epoch {epoch+1}/{args.epoch}, Train")
+        valid_pbar = tqdm(valid_ld, desc=f"Epoch {epoch+1}/{args.epoch}, Valid")
+        
+        for _,(img, labels) in enumerate(train_pbar):
+            img = img.to(device)
+            labels = labels.to(device)
+            embeddings = model(img)
+            indices_tuple = mining_func(embeddings, labels)
+            loss = loss_func(embeddings, labels, indices_tuple)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': loss.item()})
 
-end_of_epoch_hook = hooks.end_of_epoch_hook(
-    tester, dataset_dict, model_folder, test_interval=1, patience=1
-)
+        train_mean_loss = total_loss / len(train_ld)
+        
+        log_dict['train/loss'] = train_mean_loss
 
-trainer = trainers(
-    models,
-    optimizers,
-    batch_size,
-    loss_funcs,
-    train_ds,
-    mining_funcs=mining_funcs,
-    sampler=sampler,
-    dataloader_num_workers=2,
-    end_of_iteration_hook=hooks.end_of_iteration_hook,
-    end_of_epoch_hook=end_of_epoch_hook,
-)
-trainer.train(num_epochs=num_epochs)
+        print(f"Epoch: {epoch} - Train Loss: {train_mean_loss}")
+        model.eval()
+        with torch.no_grad():
+            total_loss = 0
+            for _,(img, labels) in enumerate(valid_pbar):
+                img = img.to(device)
+                labels = labels.to(device)
+                embeddings = model(img)
+                indices_tuple = mining_func(embeddings, labels)
+                loss = loss_func(embeddings, labels, indices_tuple)
+                total_loss += loss.item()
+                valid_pbar.set_postfix({'loss': loss.item()})
+        valid_mean_loss = total_loss / len(valid_ld)
+        log_dict['valid/loss'] = valid_mean_loss
+        print(f"Epoch: {epoch} - Valid Loss: {valid_mean_loss}")
+               
+        save_dict = {
+            'args' : args,
+            'model_state_dict': model.state_dict()
+        }
+        if valid_mean_loss < old_valid_loss:
+            old_valid_loss = valid_mean_loss
+            
+            torch.save(save_dict, best_model_path)
+        torch.save(save_dict, last_model_path)
+    #TEST
+    check_point = torch.load(sv_dir + f"/best.pt")
+    model.load_state_dict(check_point['model_state_dict'])
+    logs = []
+    model.eval()
+    with torch.no_grad():
+        batch_cnt = 0
+        test_total_loss = 0
+        test_correct = 0
+        for batch, (test_img, test_label) in enumerate(test_ld):
+            batch_cnt = batch
+            test_img = test_img.to(device)
+            test_label = test_label.to(device)
+            pred = model(test_img)
+
+        test_total_loss /= batch_cnt
+        test_correct /= len(test_ld.dataset)
+         
+        print(f"test loss: {test_total_loss} - test acc: {100*test_correct}")
+    log_path = sv_dir + "/log.txt"
+    with open(log_path, mode='w') as file:
+        file.writelines(logs)
